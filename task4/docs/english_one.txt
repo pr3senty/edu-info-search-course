@@ -1,0 +1,5 @@
+Hello world!
+
+This document is written in English.
+It talks about search engines, inverted index,
+and boolean queries like AND, OR and NOT.
