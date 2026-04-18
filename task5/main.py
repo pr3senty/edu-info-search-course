@@ -2,10 +2,14 @@ import os
 import json
 from pathlib import Path
 
-from lib.lsm import MergeLSMTree
-from .index import InvertedIndex
-from .analyzer import TextAnalyzer
-from . import utils
+from lib import (
+    MergeLSMTree,
+    PositionalIndex,
+    TextAnalyzer, 
+    utils
+)
+import lib.rpn as rpn_module
+
 
 DOCS_META = "docs.json"
 DOCS_DIR = "./docs"
@@ -17,14 +21,13 @@ def load_docs_map(idx_dir: Path) -> dict[str, str]:
     p = idx_dir / DOCS_META
     if not p.exists():
         return {}
-
     return json.loads(p.read_text(encoding="utf-8"))
 
 
 def save_docs_map(idx_dir: Path, m: dict[str, str]) -> None:
     (idx_dir / DOCS_META).write_text(
         json.dumps(m, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
@@ -33,6 +36,7 @@ def iter_text_files(docs_dir: Path):
         for fn in files:
             if fn.lower().endswith(SUPPORTED_DOCUMENT_EXTENSIONS):
                 yield Path(root) / fn
+
 
 def build_or_resume_index(index_dir: Path, docs_dir: Path, verbose: bool = True):
     index_dir.mkdir(parents=True, exist_ok=True)
@@ -43,28 +47,32 @@ def build_or_resume_index(index_dir: Path, docs_dir: Path, verbose: bool = True)
 
     lsm = MergeLSMTree(
         dir_path=str(runs_dir),
-        merge_func=utils.merge_roaring_bytes,
+        merge_func=utils.merge_postings_bytes,
+        mem_merge_func=utils.mem_merge_postings,
         memtable_max_items=50_000,
-        run_max_count=8
+        run_max_count=8,
     )
     analyzer = TextAnalyzer()
 
     documents_count = 0
     if docs_map:
         documents_count = max(int(k) for k in docs_map.keys()) + 1
-    index = InvertedIndex(lsm, analyzer, documents_count=documents_count)
 
-    # индексируем новые файлы (если их нет в docs.json)
+    index = PositionalIndex(lsm, analyzer, documents_count=documents_count)
+
     existing_paths = set(docs_map.values())
     added = 0
+
     for fp in iter_text_files(docs_dir):
         sp = str(fp.resolve())
         if sp in existing_paths:
             continue
+
         text = fp.read_text(encoding="utf-8", errors="ignore")
         doc_id = index.add_document(text)
         docs_map[str(doc_id)] = sp
         added += 1
+
         if verbose and added % 100 == 0:
             print(f"Indexed {added} new docs...")
 
@@ -80,12 +88,14 @@ def build_or_resume_index(index_dir: Path, docs_dir: Path, verbose: bool = True)
 
 
 HELP = """Commands:
-  query <expr>        Run boolean query. Example: query (привет AND мир)
+  query <expr>        Boolean query. Example: query (привет AND мир) OR python
+  phrase <text>       Exact phrase query. Example: phrase hello world
+  term <word>         Search one term
   add <path>          Add a file OR index all files under a directory
   show <docid>        Show file path and first lines of the document
   stats               Show docs/runs sizes
   flush               Flush memtable to a new run
-  compact             Run full compaction (merge all runs into one)
+  compact             Run full compaction
   help                Show this help
   exit / quit         Exit program
 """
@@ -94,9 +104,10 @@ HELP = """Commands:
 def cmd_stats(index_dir: Path, docs_map: dict[str, str]):
     runs = sorted((index_dir / "runs").glob("*.sst"))
     total = sum(p.stat().st_size for p in runs) if runs else 0
+
     print(f"Docs: {len(docs_map)}")
     print(f"Runs: {len(runs)}")
-    print(f"Runs size: {total / (1024*1024):.2f} MiB")
+    print(f"Runs size: {total / (1024 * 1024):.2f} MiB")
 
 
 def cmd_show(docs_map: dict[str, str], docid: int, head_lines: int = 20):
@@ -104,9 +115,10 @@ def cmd_show(docs_map: dict[str, str], docid: int, head_lines: int = 20):
     if not p:
         print("No such docid in docs.json")
         return
-    
+
     print(f"docid={docid}")
     print(p)
+
     try:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             for _ in range(head_lines):
@@ -118,7 +130,7 @@ def cmd_show(docs_map: dict[str, str], docid: int, head_lines: int = 20):
         print(f"Cannot open file: {e}")
 
 
-def cmd_add_path(index: InvertedIndex, docs_map: dict[str, str], path: str, verbose: bool = True) -> None:
+def cmd_add_path(index: PositionalIndex, docs_map: dict[str, str], path: str, verbose: bool = True) -> None:
     p = Path(path).resolve()
     if not p.exists():
         print("Path does not exist:", p)
@@ -147,6 +159,7 @@ def cmd_add_path(index: InvertedIndex, docs_map: dict[str, str], path: str, verb
         docs_map[str(doc_id)] = sp
         existing_paths.add(sp)
         added += 1
+
         if verbose:
             print(f"added docid={doc_id}: {sp}")
 
@@ -162,8 +175,9 @@ def cmd_add_path(index: InvertedIndex, docs_map: dict[str, str], path: str, verb
     print(f"Done. Added={added}, skipped={skipped}, failed={failed}")
 
 
-def run_repl(lsm, index, docs_map, index_dir: Path):
+def run_repl(lsm, index: PositionalIndex, docs_map, index_dir: Path):
     print(HELP)
+
     while True:
         try:
             s = input("invindex> ").strip()
@@ -205,12 +219,44 @@ def run_repl(lsm, index, docs_map, index_dir: Path):
                 print("Usage: show <docid>")
             continue
 
+        if s.startswith("term "):
+            q = s[len("term "):].strip()
+            if not q:
+                print("Usage: term <word>")
+                continue
+
+            try:
+                ids = index.search_term(q)
+                print(f"Matched {len(ids)} docs")
+                print(ids)
+            except Exception as e:
+                print(f"Term query error: {e}")
+            continue
+
+        if s.startswith("phrase "):
+            q = s[len("phrase "):].strip()
+            if not q:
+                print("Usage: phrase <text>")
+                continue
+
+            try:
+                ids = index.phrase_query(q)
+                print(f"Matched {len(ids)} docs")
+                print(ids)
+            except Exception as e:
+                print(f"Phrase query error: {e}")
+            continue
+
         if s.startswith("query "):
             q = s[len("query "):].strip()
+            if not q:
+                print("Usage: query <expr>")
+                continue
+
             try:
-                rpn = utils.to_rpn(utils.tokenize_query(q))
-                res = utils.eval_rpn(rpn, index)
-                ids = list(res)
+                rpn = rpn_module.to_rpn(rpn_module.tokenize_query(q))
+                postings = rpn_module.eval_rpn_postings(rpn, index)
+                ids = [doc_id for doc_id, _ in postings]
                 print(f"Matched {len(ids)} docs")
                 print(ids)
             except Exception as e:
@@ -229,7 +275,6 @@ def run_repl(lsm, index, docs_map, index_dir: Path):
                 print(f"Add error: {e}")
             continue
 
-
         print("Unknown command. Type 'help'.")
 
 
@@ -237,12 +282,18 @@ def main():
     docs_dir = Path(DOCS_DIR).resolve()
     index_dir = Path(IDX_DATA_DIR).resolve()
 
-    lsm, index, docs_map = build_or_resume_index(index_dir=index_dir, docs_dir=docs_dir, verbose=True)
+    if not docs_dir.exists():
+        print(f"Docs directory does not exist: {docs_dir}")
+        return
+
+    lsm = None
     try:
+        lsm, index, docs_map = build_or_resume_index(index_dir, docs_dir, verbose=True)
         run_repl(lsm, index, docs_map, index_dir)
     finally:
-        lsm.close()
-        print("Bye.")
+        if lsm is not None:
+            lsm.flush()
+            lsm.close()
 
 
 if __name__ == "__main__":
