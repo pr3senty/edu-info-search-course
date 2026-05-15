@@ -48,7 +48,7 @@ def encode_postings(postings: list[tuple[int, list[int]]]) -> bytes:
         doc_gap = doc_id - prev_doc
         if doc_gap < 0:
             raise ValueError("postings must be sorting by doc_id")
-       
+        
         out += encode_varint(doc_gap)
         prev_doc = doc_id
 
